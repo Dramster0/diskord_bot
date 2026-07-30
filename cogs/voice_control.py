@@ -12,6 +12,15 @@ import speech_recognition as sr
 
 log = logging.getLogger(__name__)
 
+# Временно поднимаем уровень логов самой библиотеки приёма голоса — она
+# использует стандартный logging и по умолчанию не настроена никуда,
+# поэтому её собственные ошибки (например, сбой декодера Opus) иначе
+# были бы совсем не видны в journalctl.
+logging.getLogger("discord.ext.voice_recv").setLevel(logging.DEBUG)
+_voice_recv_handler = logging.StreamHandler()
+_voice_recv_handler.setFormatter(logging.Formatter("[voice_recv] %(levelname)s %(name)s: %(message)s"))
+logging.getLogger("discord.ext.voice_recv").addHandler(_voice_recv_handler)
+
 # Модель Whisper и язык распознавания настраиваются через .env, чтобы можно
 # было подобрать баланс скорости/точности под конкретный сервер без правки
 # кода (см. README/памятку по установке — tiny/base/small).
@@ -23,6 +32,40 @@ WHISPER_LANGUAGE = os.getenv("VOICE_WHISPER_LANGUAGE", "ru")
 # Whisper по звуку тишины между репликами — заранее слово не ищем, значит
 # на CPU оно проверяется постфактум, а не потоковым keyword-spotting.
 WAKE_WORD_RE = re.compile(r"^\s*бот[,:]?\s+", re.IGNORECASE)
+
+
+class _DebugLogSink(voice_recv.AudioSink):
+    """Временная диагностическая обёртка: логирует, доходят ли вообще
+    аудио-пакеты до кода распознавания, и с каким user (или без него).
+    Не меняет сам звук — просто пропускает его дальше в реальный sink."""
+
+    def __init__(self, destination: voice_recv.AudioSink):
+        super().__init__(destination)
+        self.destination = destination
+        self._packet_count = 0
+        self._none_user_count = 0
+
+    def wants_opus(self) -> bool:
+        return self.destination.wants_opus()
+
+    def write(self, user, data):
+        self._packet_count += 1
+        if user is None:
+            self._none_user_count += 1
+
+        # Не спамим лог на каждый пакет (их десятки в секунду) — только
+        # первые несколько и потом изредка, этого достаточно для диагностики.
+        if self._packet_count <= 5 or self._packet_count % 200 == 0:
+            print(
+                f"[voice_control][debug] пакет #{self._packet_count}, "
+                f"user={user!r}, none_user_count={self._none_user_count}, "
+                f"pcm_len={len(data.pcm) if data.pcm else 0}"
+            )
+
+        self.destination.write(user, data)
+
+    def cleanup(self):
+        self.destination.cleanup()
 
 
 class VoiceControl(commands.Cog):
@@ -193,10 +236,12 @@ class VoiceControl(commands.Cog):
             await interaction.followup.send(f"Не удалось загрузить модель распознавания: {e}")
             return
 
-        sink = voice_recv.extras.speechrecognition.SpeechRecognitionSink(
-            process_cb=self._transcribe,
-            text_cb=self._handle_text,
-            phrase_time_limit=8,
+        sink = _DebugLogSink(
+            voice_recv.extras.speechrecognition.SpeechRecognitionSink(
+                process_cb=self._transcribe,
+                text_cb=self._handle_text,
+                phrase_time_limit=8,
+            )
         )
         self._sinks[guild.id] = sink
         self._text_channels[guild.id] = interaction.channel

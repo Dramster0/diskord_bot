@@ -21,6 +21,7 @@ INITIAL_COGS = [
     "cogs.dota_tracker",
     "cogs.info",
     "cogs.ai_chat",
+    "cogs.utility",
     "cogs.voice_control",
 ]
 
