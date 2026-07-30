@@ -31,11 +31,29 @@ POLL_INTERVAL_MINUTES = int(os.getenv("DOTA_POLL_INTERVAL_MINUTES", "10"))
 
 API_URL = "https://liquipedia.net/dota2/api.php"
 
+# Общая мета героев по текущему патчу (не привязана к конкретному турниру) —
+# чистый JSON API, разрешён их robots.txt (только Crawl-delay: 2 между запросами)
+D2PT_API_URL = "https://dota2protracker.com/api/heroes/list"
+D2PT_POSITION_NAMES = {
+    "1": "Carry (1)",
+    "2": "Mid (2)",
+    "3": "Offlane (3)",
+    "4": "Support (4)",
+    "5": "Hard Support (5)",
+}
+
 # Обязательно по правилам API Liquipedia — свой понятный User-Agent.
 # Впиши что-то реальное, если будешь спрашивать поддержку Liquipedia про доступ.
 HEADERS = {
     "User-Agent": "PersonalDiscordBot/1.0 (personal non-commercial use)"
 }
+
+# esport.vision — трекер live-матчей с реальными пиками/банами героев.
+# Прямого поиска по названию команды у них нет, поэтому используем открытый
+# JSON-фид со списком live-матчей (/matches) и находим нужный по именам команд,
+# а сами пики/баны берём со второго открытого эндпоинта (/stats/{id}).
+ESV_MATCHES_URL = "https://esport.vision/matches"
+ESV_STATS_URL = "https://esport.vision/stats"
 
 # Канал для напоминаний о скором начале матча. Если не задан отдельно —
 # используется тот же канал, что и для результатов.
@@ -111,6 +129,10 @@ class DotaTracker(commands.Cog):
         self._html_cache: str | None = None
         self._html_cache_time: float = 0
         self._scheduled_keys: set[str] = set()
+        self._d2pt_cache: list[dict] | None = None
+        self._d2pt_cache_time: float = 0
+        self._esv_matches_cache: list[dict] | None = None
+        self._esv_matches_cache_time: float = 0
 
         loaded_count = len(self.seen_matches_by_page.get(self.current_page, set()))
         print(
@@ -168,7 +190,8 @@ class DotaTracker(commands.Cog):
         if is_first_time:
             try:
                 html = await self.fetch_page_html()
-                matches = self._parse_matches(html)
+                loop = asyncio.get_event_loop()
+                matches = await loop.run_in_executor(None, self._parse_matches, html)
                 self.seen_matches_by_page[page] = {
                     m["key"] for m in matches if m["finished"]
                 }
@@ -261,14 +284,219 @@ class DotaTracker(commands.Cog):
         self._html_cache_time = now
         return html
 
+    async def fetch_patch_meta(self) -> list[dict]:
+        """Общая статистика героев по текущему патчу с Dota2ProTracker
+        (не привязана к конкретному турниру). Кэш на 15 минут — их
+        robots.txt просит Crawl-delay: 2, но данные и так меняются не часто."""
+        now = asyncio.get_event_loop().time()
+        if self._d2pt_cache and (now - self._d2pt_cache_time) < 900:
+            return self._d2pt_cache
+
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(D2PT_API_URL, timeout=20) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        self._d2pt_cache = data
+        self._d2pt_cache_time = now
+        return data
+
+    # ---------- esport.vision: live-матч по названиям команд + реальные пики ----------
+
+    async def fetch_esv_matches(self) -> list[dict]:
+        """Список live/недавних матчей с esport.vision — открытый JSON-фид,
+        тот же самый, что подгружает их собственная главная страница.
+        Короткий кэш (15 сек): список live-матчей быстро меняется, а
+        /прогноз не должен дёргать сайт лишний раз при повторных вызовах."""
+        now = asyncio.get_event_loop().time()
+        if self._esv_matches_cache is not None and (now - self._esv_matches_cache_time) < 15:
+            return self._esv_matches_cache
+
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(ESV_MATCHES_URL, timeout=15) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        self._esv_matches_cache = data
+        self._esv_matches_cache_time = now
+        return data
+
+    async def fetch_esv_stats(self, match_id) -> dict:
+        """Полные данные конкретного матча с esport.vision: пики, баны и
+        счёт по картам. Это тот же эндпоинт, что и страница match.html?id=...
+        дёргает у себя же (/stats/{id})."""
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(f"{ESV_STATS_URL}/{match_id}", timeout=15) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+
+    @staticmethod
+    def _split_esv_teams(teams_str: str) -> tuple[str, str]:
+        """esport.vision отдаёт команды одной строкой 'Team1 vs Team2'."""
+        parts = [p.strip() for p in teams_str.split(" vs ")]
+        if len(parts) != 2:
+            return "", ""
+        return parts[0], parts[1]
+
+    @staticmethod
+    def _fuzzy_name_match(a: str, b: str) -> bool:
+        """Мягкое сравнение названий команд: названия на esport.vision и на
+        Liquipedia не всегда совпадают дословно (сокращения, регистр), но
+        одно почти всегда является подстрокой другого."""
+        a, b = a.strip().lower(), b.strip().lower()
+        if not a or not b:
+            return False
+        return a in b or b in a
+
+    async def find_esv_live_match(self, team1_name: str, team2_name: str) -> dict | None:
+        """Ищет live-матч этих двух команд на esport.vision — по названиям,
+        без ручного ввода id или ссылок. Возвращает None, если такого
+        live-матча сейчас нет (например, играют не прямо сейчас)."""
+        try:
+            esv_matches = await self.fetch_esv_matches()
+        except Exception as e:
+            print(f"[dota_tracker] esport.vision /matches недоступен: {e}")
+            return None
+
+        for m in esv_matches:
+            if m.get("finished"):
+                continue
+            esv_t1, esv_t2 = self._split_esv_teams(m.get("teams", ""))
+            if not esv_t1 or not esv_t2:
+                continue
+
+            direct = self._fuzzy_name_match(team1_name, esv_t1) and self._fuzzy_name_match(team2_name, esv_t2)
+            swapped = self._fuzzy_name_match(team1_name, esv_t2) and self._fuzzy_name_match(team2_name, esv_t1)
+            if direct or swapped:
+                match = dict(m)
+                match["_esv_team1"] = esv_t1
+                match["_esv_team2"] = esv_t2
+                # Нужно, чтобы позже сопоставить radiant/dire именно с нашими
+                # team1/team2 (esport.vision может перечислить их в обратном
+                # порядке относительно того, как их назвали в /прогноз).
+                match["_swapped"] = swapped
+                return match
+
+        return None
+
+    def _build_esv_draft_summary(
+        self, stats: dict, esv_match: dict, team1_name: str, team2_name: str
+    ) -> str | None:
+        """Собирает текстовое описание текущих пиков/банов карты матча из
+        ответа /stats/{id}. Возвращает None, если данных о драфте пока нет
+        (например, драфт ещё не начался) или структура ответа неожиданная —
+        esport.vision источник вспомогательный, поэтому здесь мы просто
+        молча отступаем, а не роняем всю команду /прогноз."""
+        try:
+            all_matches = stats.get("allMatches") or []
+            current_num = stats.get("currentMatchNumber", 1)
+            current_map = next((mm for mm in all_matches if mm.get("number") == current_num), None)
+            if current_map is None and all_matches:
+                current_map = all_matches[-1]
+            if current_map is None:
+                return None
+
+            is_t1_radiant = current_map.get("isTeam1Radiant")
+            if is_t1_radiant is None:
+                is_t1_radiant = stats.get("isTeam1Radiant")
+            # Если так и не удалось узнать — считаем, что esv-team1 играет
+            # радиантом, это просто дефолт на случай отсутствующих данных.
+            esv_team1_is_radiant = bool(is_t1_radiant) if is_t1_radiant is not None else True
+            swapped = esv_match.get("_swapped", False)
+
+            def esv_side_to_our_team(is_radiant_side: bool) -> str:
+                is_esv_team1 = (is_radiant_side == esv_team1_is_radiant)
+                if not swapped:
+                    return team1_name if is_esv_team1 else team2_name
+                return team2_name if is_esv_team1 else team1_name
+
+            team_for_radiant = esv_side_to_our_team(True)
+            team_for_dire = esv_side_to_our_team(False)
+
+            picks = current_map.get("picks") or {}
+            radiant_picks = [p.get("heroName") for p in (picks.get("radiant") or []) if p.get("heroName")]
+            dire_picks = [p.get("heroName") for p in (picks.get("dire") or []) if p.get("heroName")]
+
+            lines = []
+            if radiant_picks:
+                lines.append(f"{team_for_radiant}: {', '.join(radiant_picks)}")
+            if dire_picks:
+                lines.append(f"{team_for_dire}: {', '.join(dire_picks)}")
+
+            # Если финальных пиков ещё нет (драфт в процессе) — берём
+            # черновой фид, там же видно и баны. match.draft — основной
+            # источник, liveDraft — резервный (см. разбор match.html).
+            if not lines:
+                draft = current_map.get("draft") or []
+                live_draft = stats.get("liveDraft") or {}
+                if (
+                    not draft
+                    and live_draft.get("draft")
+                    and live_draft.get("mapNumber") == current_num
+                ):
+                    draft = live_draft["draft"]
+                    ld_t1_radiant = live_draft.get("isTeam1Radiant")
+                    if ld_t1_radiant is not None:
+                        esv_team1_is_radiant = bool(ld_t1_radiant)
+                        team_for_radiant = esv_side_to_our_team(True)
+                        team_for_dire = esv_side_to_our_team(False)
+
+                picks_r, picks_d, bans_r, bans_d = [], [], [], []
+                for d in draft:
+                    name = d.get("heroName") or d.get("hero")
+                    if not name:
+                        continue
+                    side_bucket = picks_r if d.get("side") == "radiant" else picks_d
+                    ban_bucket = bans_r if d.get("side") == "radiant" else bans_d
+                    (side_bucket if d.get("action") == "pick" else ban_bucket).append(name)
+
+                if picks_r:
+                    lines.append(f"{team_for_radiant} уже пикнули: {', '.join(picks_r)}")
+                if picks_d:
+                    lines.append(f"{team_for_dire} уже пикнули: {', '.join(picks_d)}")
+                if bans_r:
+                    lines.append(f"{team_for_radiant} забанили: {', '.join(bans_r)}")
+                if bans_d:
+                    lines.append(f"{team_for_dire} забанили: {', '.join(bans_d)}")
+
+            if not lines:
+                return None
+
+            return (
+                f"Реальный live-драфт этого матча прямо сейчас (карта {current_num}, "
+                f"источник esport.vision): " + "; ".join(lines)
+            )
+        except Exception as e:
+            print(f"[dota_tracker] Не удалось разобрать пики esport.vision: {e}")
+            return None
+
+    async def fetch_esv_draft_context(self, team1_name: str, team2_name: str) -> str | None:
+        """Полный пайплайн для /прогноз: найти live-матч этих команд на
+        esport.vision (без ручного ввода id) и собрать текст с реальными
+        пиками/банами для промпта ИИ. Возвращает None на любой осечке —
+        esport.vision тут вспомогательный источник, а не критичный: /прогноз
+        должен продолжать работать и без него."""
+        esv_match = await self.find_esv_live_match(team1_name, team2_name)
+        if esv_match is None:
+            return None
+
+        try:
+            stats = await self.fetch_esv_stats(esv_match["id"])
+        except Exception as e:
+            print(f"[dota_tracker] esport.vision /stats/{esv_match['id']} недоступен: {e}")
+            return None
+
+        return self._build_esv_draft_summary(stats, esv_match, team1_name, team2_name)
+
     async def fetch_matches(self) -> list[dict]:
         """Скачивает страницу турнира через официальный API и парсит матчи.
         Комбинирует два формата разметки Liquipedia: таблицы группового этапа
         (brkts-matchlist) и таблицы расписания стадий вроде Survival/Playoffs
         (table2__table) — так поддерживаются оба вида страниц турнира."""
         html = await self.fetch_page_html()
-        matches = self._parse_matches(html)
-        matches += self._parse_schedule_tables(html)
+        loop = asyncio.get_event_loop()
+        matches = await loop.run_in_executor(None, self._parse_matches, html)
+        matches += await loop.run_in_executor(None, self._parse_schedule_tables, html)
         return matches
 
     async def search_tournaments(self, query: str) -> list[dict]:
@@ -884,7 +1112,8 @@ class DotaTracker(commands.Cog):
             await interaction.followup.send(f"Не удалось получить данные с Liquipedia: {e}")
             return
 
-        standings = self._parse_standings(html, буква)
+        loop = asyncio.get_event_loop()
+        standings = await loop.run_in_executor(None, self._parse_standings, html, буква)
         if standings is None:
             await interaction.followup.send(
                 f"Группа «{буква}» не найдена на текущем турнире "
@@ -917,7 +1146,8 @@ class DotaTracker(commands.Cog):
             await interaction.followup.send(f"Не удалось получить данные с Liquipedia: {e}")
             return
 
-        all_matches = self._parse_matches(html)
+        loop = asyncio.get_event_loop()
+        all_matches = await loop.run_in_executor(None, self._parse_matches, html)
         target_group = f"Group {буква.upper()}"
         group_matches = [
             m for m in all_matches
@@ -964,7 +1194,8 @@ class DotaTracker(commands.Cog):
             await interaction.followup.send(f"Не удалось получить данные с Liquipedia: {e}")
             return
 
-        all_matches = self._parse_matches(html)
+        loop = asyncio.get_event_loop()
+        all_matches = await loop.run_in_executor(None, self._parse_matches, html)
         finished = [m for m in all_matches if m["finished"] and m["timestamp"]]
 
         if not finished:
@@ -1024,7 +1255,8 @@ class DotaTracker(commands.Cog):
             await interaction.followup.send(f"Не удалось получить данные с Liquipedia: {e}")
             return
 
-        heroes = self._parse_hero_stats(html)
+        loop = asyncio.get_event_loop()
+        heroes = await loop.run_in_executor(None, self._parse_hero_stats, html)
         if not heroes:
             await interaction.followup.send(
                 "Статистика героев не найдена на текущем турнире."
@@ -1060,7 +1292,8 @@ class DotaTracker(commands.Cog):
             await interaction.followup.send(f"Не удалось получить данные с Liquipedia: {e}")
             return
 
-        streams = self._parse_streams(html)
+        loop = asyncio.get_event_loop()
+        streams = await loop.run_in_executor(None, self._parse_streams, html)
         if not streams:
             await interaction.followup.send(
                 "Русскоязычных трансляций для текущего турнира не найдено."
@@ -1074,6 +1307,239 @@ class DotaTracker(commands.Cog):
                 lines.append(link)
 
         lines.append(f"\n-# Источник: Liquipedia · Турнир: {self.current_page.replace('_', ' ')}")
+        await interaction.followup.send("\n".join(lines))
+
+    # ---------- ИИ-прогнозист ----------
+
+    def _team_matches_query(self, m: dict, query: str) -> bool:
+        q = query.strip().lower()
+        candidates = (m["team1"], m["team2"], m["team1_short"], m["team2_short"])
+        return any(c.lower() == q for c in candidates if c)
+
+    def _build_team_summary(self, matches: list[dict], query: str) -> dict | None:
+        """Собирает статистику команды по уже сыгранным матчам турнира:
+        реальное имя, счёт побед/поражений, список последних результатов.
+        Имя команды резолвим по ЛЮБОМУ матчу (не обязательно завершённому) —
+        иначе /прогноз отказывался работать для первого матча команды на
+        турнире/стадии (0 завершённых игр), хотя это как раз тот случай,
+        когда полезнее всего показать live-пики с esport.vision."""
+        q = query.strip().lower()
+        all_team_matches = [m for m in matches if self._team_matches_query(m, query)]
+        if not all_team_matches:
+            return None
+
+        finished_matches = [m for m in all_team_matches if m["finished"]]
+        name_source = finished_matches or all_team_matches
+        name_source = sorted(name_source, key=lambda m: m["timestamp"] or 0)
+
+        display_name = query
+        first = name_source[0]
+        for full, short in (
+            (first["team1"], first["team1_short"]),
+            (first["team2"], first["team2_short"]),
+        ):
+            if full.lower() == q or (short and short.lower() == q):
+                display_name = full
+                break
+
+        finished_matches.sort(key=lambda m: m["timestamp"] or 0)
+        wins, losses, recent = 0, 0, []
+        for m in finished_matches:
+            is_team1 = m["team1"].lower() == display_name.lower()
+            own_score = m["score1"] if is_team1 else m["score2"]
+            opp_score = m["score2"] if is_team1 else m["score1"]
+            opponent = m["team2"] if is_team1 else m["team1"]
+            try:
+                won = int(own_score) > int(opp_score)
+            except (ValueError, TypeError):
+                continue
+            if won:
+                wins += 1
+            else:
+                losses += 1
+            recent.append(f"{'W' if won else 'L'} vs {opponent} ({own_score}:{opp_score})")
+
+        return {
+            "name": display_name,
+            "wins": wins,
+            "losses": losses,
+            "recent": recent[-5:],  # последние 5 матчей
+        }
+
+    def _find_head_to_head(self, matches: list[dict], team1: str, team2: str) -> list[str]:
+        """Ищет прошлые очные встречи этих двух команд на турнире."""
+        results = []
+        for m in matches:
+            if not m["finished"]:
+                continue
+            if self._team_matches_query(m, team1) and self._team_matches_query(m, team2):
+                results.append(f"{m['team1']} {m['score1']} : {m['score2']} {m['team2']}")
+        return results
+
+    @discord.app_commands.command(
+        name="прогноз", description="Шуточный ИИ-прогноз матча (не для ставок, просто ради интереса)"
+    )
+    @discord.app_commands.describe(
+        команда1="Первая команда (можно сокращение)",
+        команда2="Вторая команда (можно сокращение)",
+    )
+    async def predict(
+        self, interaction: discord.Interaction, команда1: str, команда2: str
+    ):
+        await interaction.response.defer()
+
+        ai_cog = self.bot.get_cog("AIChat")
+        if ai_cog is None:
+            await interaction.followup.send(
+                "Модуль ИИ сейчас не загружен, прогноз сделать не получится."
+            )
+            return
+
+        try:
+            matches = await self.fetch_matches()
+            html = await self.fetch_page_html()
+        except Exception as e:
+            await interaction.followup.send(f"Не удалось получить данные с Liquipedia: {e}")
+            return
+
+        team1_stats = self._build_team_summary(matches, команда1)
+        team2_stats = self._build_team_summary(matches, команда2)
+
+        if team1_stats is None or team2_stats is None:
+            missing = команда1 if team1_stats is None else команда2
+            await interaction.followup.send(
+                f"Не нашёл команду «{missing}» на текущем турнире "
+                f"({self.current_page.replace('_', ' ')}). Проверь название или переключи "
+                f"турнир командой /турнир на нужную стадию (группа/плей-офф и т.п.)."
+            )
+            return
+
+        head_to_head = self._find_head_to_head(matches, команда1, команда2)
+
+        # Реальные пики/баны героев этого конкретного матча с esport.vision —
+        # находим сами, без ручного ввода команд или id. Если матч сейчас не
+        # идёт live (или esport.vision недоступен) — просто не добавляем блок,
+        # /прогноз продолжает работать как раньше.
+        esv_draft_context = None
+        try:
+            esv_draft_context = await self.fetch_esv_draft_context(
+                team1_stats["name"], team2_stats["name"]
+            )
+        except Exception as e:
+            print(f"[dota_tracker] Не удалось получить live-пики с esport.vision: {e}")
+
+        # Общая мета-статистика героев турнира (не привязана к конкретной
+        # команде — детальных данных по драфтам каждой команды в источнике
+        # нет, но общий контекст меты добавляет прогнозу живости)
+        loop = asyncio.get_event_loop()
+        heroes = await loop.run_in_executor(None, self._parse_hero_stats, html)
+        top_heroes = sorted(
+            heroes, key=lambda h: int(h["picks"]) if h["picks"].isdigit() else 0, reverse=True
+        )[:5]
+        meta_line = "; ".join(
+            f"{h['hero']} ({h['picks']} пиков, WR {h['winrate']})" for h in top_heroes
+        )
+
+        prompt_parts = [
+            "Ты составляешь шуточный прогноз на матч по Dota 2 для друзей в Discord. "
+            "Это не серьёзная аналитика и не ставки — просто весёлый прогноз с лёгким обоснованием, "
+            "2-4 предложения. В конце явно укажи, какая команда, по-твоему, победит.",
+            "",
+            f"Команда 1: {team1_stats['name']}",
+            f"Форма на турнире: {team1_stats['wins']}-{team1_stats['losses']} (побед-поражений)",
+            f"Последние матчи: {'; '.join(team1_stats['recent']) or 'нет данных'}",
+            "",
+            f"Команда 2: {team2_stats['name']}",
+            f"Форма на турнире: {team2_stats['wins']}-{team2_stats['losses']} (побед-поражений)",
+            f"Последние матчи: {'; '.join(team2_stats['recent']) or 'нет данных'}",
+        ]
+
+        if meta_line:
+            prompt_parts.append("")
+            prompt_parts.append(f"Топ-5 популярных героев турнира (общая мета, не по командам): {meta_line}")
+
+        if head_to_head:
+            prompt_parts.append("")
+            prompt_parts.append("Личные встречи на этом турнире: " + "; ".join(head_to_head))
+
+        if esv_draft_context:
+            prompt_parts.append("")
+            prompt_parts.append(esv_draft_context)
+            prompt_parts.append(
+                "Учти эти реальные пики в прогнозе — это не общая статистика, "
+                "а то, что команды выбрали именно в этой игре прямо сейчас."
+            )
+
+        prompt = "\n".join(prompt_parts)
+
+        try:
+            prediction = await ai_cog.ask_ai(prompt)
+        except Exception as e:
+            await interaction.followup.send(f"Не удалось получить прогноз от ИИ: {e}")
+            return
+
+        source_note = "Шуточный прогноз ИИ на основе статистики турнира"
+        if esv_draft_context:
+            source_note += " и live-пиков esport.vision"
+
+        text = (
+            f"🔮 **Прогноз: {team1_stats['name']} vs {team2_stats['name']}**\n\n"
+            f"{prediction}\n\n"
+            f"-# {source_note}, не финансовый совет и не гарантия результата"
+        )
+        await interaction.followup.send(text)
+
+    # ---------- Общая мета героев по патчу ----------
+
+    @discord.app_commands.command(
+        name="патчмета", description="Общий винрейт героев по текущему патчу (не по турниру)"
+    )
+    @discord.app_commands.describe(
+        позиция="Позиция: 1 (керри), 2 (мид), 3 (лес), 4 (саппорт), 5 (хард саппорт), или пусто для всех ролей",
+        количество="Сколько героев показать (по умолчанию 15)",
+    )
+    async def patch_meta(
+        self, interaction: discord.Interaction, позиция: str = "", количество: int = 15
+    ):
+        await interaction.response.defer()
+
+        try:
+            heroes = await self.fetch_patch_meta()
+        except Exception as e:
+            await interaction.followup.send(f"Не удалось получить данные с Dota2ProTracker: {e}")
+            return
+
+        pos = позиция.strip()
+        if pos and pos not in D2PT_POSITION_NAMES:
+            await interaction.followup.send(
+                "Позиция должна быть числом от 1 до 5 (или пусто для общей статистики)."
+            )
+            return
+
+        if pos:
+            matches_key, winrate_key = f"pos {pos} matches", f"pos {pos} winrate"
+            title_suffix = D2PT_POSITION_NAMES[pos]
+        else:
+            matches_key, winrate_key = "all matches", "all winrate"
+            title_suffix = "все роли"
+
+        # берём только героев с осмысленным числом игр на этой позиции,
+        # сортируем по винрейту
+        filtered = [h for h in heroes if h.get(matches_key, 0) >= 50]
+        filtered.sort(key=lambda h: h.get(winrate_key, 0), reverse=True)
+        top = filtered[:количество]
+
+        if not top:
+            await interaction.followup.send("Данных по этой позиции не нашлось.")
+            return
+
+        lines = [f"**Мета героев текущего патча** ({title_suffix})", "```"]
+        lines.append(f"{'Герой':<20}{'WR':<8}{'Игр':<8}")
+        for h in top:
+            winrate_pct = h.get(winrate_key, 0) * 100
+            lines.append(f"{h['displayName']:<20}{winrate_pct:<7.1f}%{h.get(matches_key, 0):<8}")
+        lines.append("```")
+        lines.append("-# Источник: Dota2ProTracker (текущий патч, не привязано к турниру)")
         await interaction.followup.send("\n".join(lines))
 
 

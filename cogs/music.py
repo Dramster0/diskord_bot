@@ -4,6 +4,7 @@ import time
 import asyncio
 import discord
 from discord.ext import commands
+from discord.ext import voice_recv
 from discord import app_commands
 import yt_dlp
 import aiohttp
@@ -319,6 +320,36 @@ class Music(commands.Cog):
             except Exception as e:
                 print(f"[music] Не удалось отправить сообщение 'Играю': {e}")
 
+    async def play_query_for_voice(
+        self, guild: discord.Guild, text_channel: discord.abc.Messageable, query: str
+    ) -> str:
+        """Версия /play без discord.Interaction — вызывается из голосового
+        управления, когда фраза 'бот поставь ...' распознана через Whisper.
+        Предполагает, что бот уже подключён к голосовому каналу (голосовое
+        управление и так работает только пока бот в войсе), поэтому сюда
+        подключение не входит."""
+        voice_client = guild.voice_client
+        if voice_client is None or not voice_client.is_connected():
+            return "Бот сейчас не в голосовом канале."
+
+        try:
+            track = await asyncio.wait_for(self.extract_track(query), timeout=20)
+        except asyncio.TimeoutError:
+            return "Поиск трека занял слишком много времени."
+        except Exception as e:
+            return f"Не удалось найти трек: {e}"
+
+        self.now_playing_channels[guild.id] = text_channel
+
+        queue = self.get_queue(guild.id)
+        queue.append(track)
+
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await self.play_next(guild, voice_client)
+            return f"🎶 Добавил: **{track['title']}**"
+        else:
+            return f"➕ Добавлено в очередь: **{track['title']}**"
+
     @app_commands.command(name="play", description="Включить трек по названию или ссылке")
     @app_commands.describe(query="Название песни или ссылка (YouTube и т.д.)")
     async def play(self, interaction: discord.Interaction, query: str):
@@ -337,7 +368,11 @@ class Music(commands.Cog):
         if voice_client is None:
             print("[play] пытаюсь подключиться к голосовому каналу...")
             try:
-                voice_client = await asyncio.wait_for(voice_channel.connect(), timeout=15)
+                # cls=VoiceRecvClient — тот же клиент умеет и проигрывать музыку,
+                # и (если включат /голосуправление) принимать голос из канала.
+                voice_client = await asyncio.wait_for(
+                    voice_channel.connect(cls=voice_recv.VoiceRecvClient), timeout=15
+                )
                 print("[play] подключение к голосовому каналу успешно")
             except asyncio.TimeoutError:
                 print("[play] ТАЙМАУТ подключения к голосовому каналу (15 сек)")
@@ -435,7 +470,9 @@ class Music(commands.Cog):
         voice_client = interaction.guild.voice_client
         if voice_client is None:
             try:
-                voice_client = await asyncio.wait_for(voice_channel.connect(), timeout=15)
+                voice_client = await asyncio.wait_for(
+                    voice_channel.connect(cls=voice_recv.VoiceRecvClient), timeout=15
+                )
             except Exception as e:
                 await interaction.followup.send(f"Ошибка подключения к каналу: {e}")
                 return
