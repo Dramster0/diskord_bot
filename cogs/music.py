@@ -26,12 +26,7 @@ YTDL_OPTIONS = {
 }
 
 FFMPEG_OPTIONS = {
-    # -4 — принудительно использовать IPv4 для соединения с серверами
-    # googlevideo.com. Без этого ffmpeg иногда пытается идти через IPv6,
-    # а YouTube на IPv6-адресах дата-центров (Aeza и т.п.) блокирует запросы
-    # заметно агрессивнее, из-за чего реальное скачивание потока падает с
-    # 403 Forbidden, даже когда yt-dlp успешно нашёл сам трек и ссылку.
-    "before_options": "-4 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
 
