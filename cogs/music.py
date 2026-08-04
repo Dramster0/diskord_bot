@@ -2,9 +2,9 @@ import os
 import re
 import time
 import asyncio
+import tempfile
 import discord
 from discord.ext import commands
-from discord.ext import voice_recv
 from discord import app_commands
 import yt_dlp
 import aiohttp
@@ -15,31 +15,28 @@ YTDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    # Раньше здесь была жёстко зафиксирована пара клиентов (tv, web), но
-    # выяснилось, что YouTube в моменте блокирует то один клиент, то другой
-    # (то 403 на android_vr, то DRM-эксперимент на tv) — это меняется чуть
-    # ли не еженедельно. Разработчики yt-dlp сами держат актуальный порядок
-    # клиентов под капотом и обновляют его почти в каждом релизе именно под
-    # эти блокировки, так что надёжнее довериться дефолту свежей версии,
-    # чем фиксировать конкретные клиенты руками.
+    # source_address на 0.0.0.0 (IPv4) не нужен — IPv6 отключён на уровне ОС
+    # сервера (/etc/sysctl.conf), так что весь трафик и так идёт по IPv4.
+    "remote_components": ["ejs:github"],
 }
-
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
-
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
 # Отдельный "быстрый" экземпляр — только достаёт список видео из плейлиста
 # (id, название), без разрешения потоковой ссылки для каждого видео сразу.
-# Реальный поток каждого видео достаётся по одному, лениво, при добавлении в очередь.
 YTDL_FLAT_OPTIONS = {
     "quiet": True,
     "extract_flat": "in_playlist",
     "skip_download": True,
 }
+
+FFMPEG_OPTIONS = {
+    # На входе — обычный полностью скачанный локальный файл (yt-dlp качает
+    # его целиком заранее), не поток и не "труба" — так что специальные
+    # флаги для живого вещания тут не нужны.
+    "before_options": "",
+    "options": "-vn",
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 ytdl_flat = yt_dlp.YoutubeDL(YTDL_FLAT_OPTIONS)
 
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -108,7 +105,7 @@ class Music(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Очередь треков для каждого сервера: {guild_id: [ {title, url, stream_url}, ... ]}
+        # Очередь треков для каждого сервера: {guild_id: [ {title, url, ...}, ... ]}
         self.queues: dict[int, list[dict]] = {}
         # Канал, куда постить "Играю: ..." при автоматической смене трека —
         # запоминаем последний канал, откуда была команда /play или /playlist
@@ -124,6 +121,55 @@ class Music(commands.Cog):
         if guild_id not in self.queues:
             self.queues[guild_id] = []
         return self.queues[guild_id]
+
+    # ---------- Поиск и скачивание треков ----------
+
+    async def extract_track(self, query: str, retries: int = 2) -> dict:
+        loop = asyncio.get_event_loop()
+        last_error = None
+        search_start = time.monotonic()
+
+        for attempt in range(retries + 1):
+            try:
+                data = await loop.run_in_executor(
+                    None, lambda: ytdl.extract_info(query, download=False)
+                )
+                if "entries" in data:
+                    data = data["entries"][0]
+
+                search_time = time.monotonic() - search_start
+                print(f"[music] Поиск трека «{query}» занял {search_time:.1f} сек")
+
+                return {
+                    "title": data.get("title", "Неизвестный трек"),
+                    "url": data.get("webpage_url", query),
+                }
+            except Exception as e:
+                last_error = e
+                # DNS-обрывы и подобные сетевые сбои часто временные —
+                # пробуем ещё раз перед тем, как сдаться
+                if attempt < retries:
+                    print(f"[music] Попытка {attempt + 1} не удалась ({e}), пробую снова...")
+                    await asyncio.sleep(1.5)
+
+        raise last_error
+
+    async def fetch_youtube_playlist_videos(self, playlist_url: str) -> list[str]:
+        """Быстро получает список прямых ссылок на видео YouTube-плейлиста
+        (без разрешения потоковых ссылок — это происходит по одному позже)."""
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None, lambda: ytdl_flat.extract_info(playlist_url, download=False)
+        )
+        entries = data.get("entries", [])
+        urls = []
+        for entry in entries:
+            if not entry:
+                continue
+            video_id = entry.get("id") or entry.get("url")
+            if video_id:
+                urls.append(f"https://www.youtube.com/watch?v={video_id}")
+        return urls
 
     # ---------- Spotify: получение токена и списка треков плейлиста ----------
 
@@ -149,12 +195,14 @@ class Music(commands.Cog):
                 data = await resp.json()
 
         self._spotify_token = data["access_token"]
-        # обновляем чуть раньше реального истечения, для запаса
         self._spotify_token_expires = time.time() + data.get("expires_in", 3600) - 60
         return self._spotify_token
 
     async def fetch_spotify_playlist_tracks(self, playlist_id: str) -> list[str]:
-        """Возвращает список треков плейлиста в виде строк 'Исполнитель - Название'."""
+        """Возвращает список треков плейлиста в виде строк 'Исполнитель - Название'.
+        Примечание: с февраля 2026 Spotify отдаёт полный список треков только
+        для ПУБЛИЧНЫХ плейлистов, принадлежащих самому владельцу API-приложения —
+        для чужих плейлистов вернётся 403 Forbidden, это ограничение самого Spotify."""
         token = await self.get_spotify_token()
         headers = {"Authorization": f"Bearer {token}"}
         url = (
@@ -182,23 +230,6 @@ class Music(commands.Cog):
 
         return tracks
 
-    async def fetch_youtube_playlist_videos(self, playlist_url: str) -> list[str]:
-        """Быстро получает список прямых ссылок на видео YouTube-плейлиста
-        (без разрешения потоковых ссылок — это происходит по одному позже)."""
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(
-            None, lambda: ytdl_flat.extract_info(playlist_url, download=False)
-        )
-        entries = data.get("entries", [])
-        urls = []
-        for entry in entries:
-            if not entry:
-                continue
-            video_id = entry.get("id") or entry.get("url")
-            if video_id:
-                urls.append(f"https://www.youtube.com/watch?v={video_id}")
-        return urls
-
     # ---------- Яндекс Музыка (неофициальная библиотека) ----------
 
     async def get_yandex_client(self) -> YandexClient:
@@ -219,15 +250,14 @@ class Music(commands.Cog):
 
     async def fetch_yandex_playlist_tracks(self, owner: str, kind: int) -> list[str]:
         """Возвращает список треков плейлиста Яндекс Музыки в виде строк
-        'Исполнитель - Название'."""
+        'Исполнитель - Название'. Примечание: Яндекс Музыка ограничивает доступ
+        по географии (451 Unavailable For Legal Reasons для не-РФ/СНГ серверов)."""
         client = await self.get_yandex_client()
         loop = asyncio.get_event_loop()
 
         def _fetch():
             playlist = client.users_playlists(kind, user_id=owner)
-            short_tracks = playlist.tracks
-            full_tracks = playlist.fetch_tracks()
-            return full_tracks
+            return playlist.fetch_tracks()
 
         full_tracks = await loop.run_in_executor(None, _fetch)
 
@@ -261,31 +291,7 @@ class Music(commands.Cog):
                 result.append(f"{artists} - {title}" if artists else title)
         return result
 
-    async def extract_track(self, query: str, retries: int = 2) -> dict:
-        loop = asyncio.get_event_loop()
-        last_error = None
-
-        for attempt in range(retries + 1):
-            try:
-                data = await loop.run_in_executor(
-                    None, lambda: ytdl.extract_info(query, download=False)
-                )
-                if "entries" in data:
-                    data = data["entries"][0]
-                return {
-                    "title": data.get("title", "Неизвестный трек"),
-                    "url": data.get("webpage_url", query),
-                    "stream_url": data["url"],
-                }
-            except Exception as e:
-                last_error = e
-                # DNS-обрывы и подобные сетевые сбои часто временные —
-                # пробуем ещё раз перед тем, как сдаться
-                if attempt < retries:
-                    print(f"[music] Попытка {attempt + 1} не удалась ({e}), пробую снова...")
-                    await asyncio.sleep(1.5)
-
-        raise last_error
+    # ---------- Воспроизведение ----------
 
     async def play_next(self, guild: discord.Guild, voice_client: discord.VoiceClient):
         # Убираем кнопки с предыдущего сообщения "Играю" — трек уже закончился
@@ -302,11 +308,53 @@ class Music(commands.Cog):
             return
 
         track = queue.pop(0)
-        source = discord.FFmpegPCMAudio(track["stream_url"], **FFMPEG_OPTIONS)
+
+        # ВАЖНО: качаем трек через встроенный загрузчик yt-dlp (download=True),
+        # а НЕ через ручной curl/aiohttp! Проверено на практике: ручной curl
+        # тянул файлы по 50-100+ секунд без видимой причины (хотя сеть в
+        # остальном быстрая), тогда как встроенный загрузчик yt-dlp скачивает
+        # тот же файл меньше чем за секунду — у него свои оптимизации под
+        # googlevideo.com, которых не хватает голому curl.
+        tmp_dir = tempfile.mkdtemp()
+        tmp_template = os.path.join(tmp_dir, "track.%(ext)s")
+
+        download_options = dict(YTDL_OPTIONS)
+        download_options["outtmpl"] = tmp_template
+        download_options["quiet"] = True
+
+        loop = asyncio.get_event_loop()
+        tmp_path = None
+
+        def _download():
+            with yt_dlp.YoutubeDL(download_options) as dl:
+                info = dl.extract_info(track["url"], download=True)
+                if "entries" in info:
+                    info = info["entries"][0]
+                return dl.prepare_filename(info)
+
+        try:
+            download_start = time.monotonic()
+            tmp_path = await loop.run_in_executor(None, _download)
+            download_time = time.monotonic() - download_start
+            file_size = os.path.getsize(tmp_path) if tmp_path and os.path.exists(tmp_path) else 0
+            print(
+                f"[music] Скачивание заняло {download_time:.1f} сек, "
+                f"размер файла {file_size / 1024:.0f} КБ"
+            )
+        except Exception as e:
+            print(f"[music] Ошибка скачивания трека: {e}")
+
+        source = discord.FFmpegPCMAudio(tmp_path, **FFMPEG_OPTIONS)
 
         def after_playing(error):
             if error:
                 print(f"Ошибка воспроизведения: {error}")
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
             fut = asyncio.run_coroutine_threadsafe(
                 self.play_next(guild, voice_client), self.bot.loop
             )
@@ -327,35 +375,7 @@ class Music(commands.Cog):
             except Exception as e:
                 print(f"[music] Не удалось отправить сообщение 'Играю': {e}")
 
-    async def play_query_for_voice(
-        self, guild: discord.Guild, text_channel: discord.abc.Messageable, query: str
-    ) -> str:
-        """Версия /play без discord.Interaction — вызывается из голосового
-        управления, когда фраза 'бот поставь ...' распознана через Whisper.
-        Предполагает, что бот уже подключён к голосовому каналу (голосовое
-        управление и так работает только пока бот в войсе), поэтому сюда
-        подключение не входит."""
-        voice_client = guild.voice_client
-        if voice_client is None or not voice_client.is_connected():
-            return "Бот сейчас не в голосовом канале."
-
-        try:
-            track = await asyncio.wait_for(self.extract_track(query), timeout=20)
-        except asyncio.TimeoutError:
-            return "Поиск трека занял слишком много времени."
-        except Exception as e:
-            return f"Не удалось найти трек: {e}"
-
-        self.now_playing_channels[guild.id] = text_channel
-
-        queue = self.get_queue(guild.id)
-        queue.append(track)
-
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            await self.play_next(guild, voice_client)
-            return f"🎶 Добавил: **{track['title']}**"
-        else:
-            return f"➕ Добавлено в очередь: **{track['title']}**"
+    # ---------- Команды ----------
 
     @app_commands.command(name="play", description="Включить трек по названию или ссылке")
     @app_commands.describe(query="Название песни или ссылка (YouTube и т.д.)")
@@ -375,11 +395,7 @@ class Music(commands.Cog):
         if voice_client is None:
             print("[play] пытаюсь подключиться к голосовому каналу...")
             try:
-                # cls=VoiceRecvClient — тот же клиент умеет и проигрывать музыку,
-                # и (если включат /голосуправление) принимать голос из канала.
-                voice_client = await asyncio.wait_for(
-                    voice_channel.connect(cls=voice_recv.VoiceRecvClient), timeout=15
-                )
+                voice_client = await asyncio.wait_for(voice_channel.connect(), timeout=15)
                 print("[play] подключение к голосовому каналу успешно")
             except asyncio.TimeoutError:
                 print("[play] ТАЙМАУТ подключения к голосовому каналу (15 сек)")
@@ -420,9 +436,9 @@ class Music(commands.Cog):
             await interaction.followup.send(f"➕ Добавлено в очередь: **{track['title']}**")
 
     @app_commands.command(
-        name="playlist", description="Добавить в очередь весь плейлист (Spotify или YouTube) по ссылке"
+        name="playlist", description="Добавить в очередь весь плейлист (Spotify, YouTube или Яндекс Музыка) по ссылке"
     )
-    @app_commands.describe(ссылка="Ссылка на публичный плейлист Spotify или YouTube")
+    @app_commands.describe(ссылка="Ссылка на публичный плейлист Spotify, YouTube или Яндекс Музыки")
     async def playlist(self, interaction: discord.Interaction, ссылка: str):
         await interaction.response.defer()
 
@@ -477,9 +493,7 @@ class Music(commands.Cog):
         voice_client = interaction.guild.voice_client
         if voice_client is None:
             try:
-                voice_client = await asyncio.wait_for(
-                    voice_channel.connect(cls=voice_recv.VoiceRecvClient), timeout=15
-                )
+                voice_client = await asyncio.wait_for(voice_channel.connect(), timeout=15)
             except Exception as e:
                 await interaction.followup.send(f"Ошибка подключения к каналу: {e}")
                 return
