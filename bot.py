@@ -22,7 +22,6 @@ INITIAL_COGS = [
     "cogs.info",
     "cogs.ai_chat",
     "cogs.utility",
-    "cogs.voice_control",
 ]
 
 

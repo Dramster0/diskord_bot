@@ -1,4 +1,4 @@
-discord.py[voice]>=2.5.0
+discord.py>=2.3.0
 yt-dlp>=2024.1.0
 PyNaCl>=1.5.0
 python-dotenv>=1.0.0
@@ -12,7 +12,8 @@ yandex-music>=2.2.0
 google-genai>=0.1.0
 groq>=0.11.0
 
-# Голосовое управление (/голосуправление)
-discord-ext-voice-recv[extras-speech]>=0.5.2a179
-faster-whisper>=1.0.0
-numpy>=1.24.0
+# PO-token провайдер для yt-dlp (нужен для обхода антибот-защиты YouTube,
+# используется вместе с локальной службой bgutil-pot и JS-движком Deno —
+# см. README/памятку по установке). Был установлен вручную через pip
+# в другом чате, но не был занесён сюда — теперь зафиксировано.
+bgutil-ytdlp-pot-provider>=1.3.1
